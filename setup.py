@@ -8,5 +8,5 @@ setup(name='imageQualityCT',
       author_email='kwinten.torfs@kuleuven.be',
       url='https://github.com/KwintenTorfs/ImageQualityCT',
       packages=['imageQualityCT'],
-      license='KUL',
+      license='MIT',
       )
