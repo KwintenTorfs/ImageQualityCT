@@ -21,6 +21,8 @@ anam_truncation_correction = 1.15
 kwinten_threshold_list = [-400, -200]
 
 
+booo = 100
+
 def ssde_conversion(wed: float, phantom: str):
     """
         Conversion factors for translating CTDI in SSDE depending on patient size (WED)
