@@ -214,7 +214,6 @@ def truncation_corrected_wed(wed: float, truncation_percentage: float, scaling_p
     truncation_correction: float
           Factor that relates truncation corrected to truncation uncorrected WED
 
-
     References
     ----------
 
