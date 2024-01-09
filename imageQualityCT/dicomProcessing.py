@@ -6,11 +6,7 @@ from pydicom.errors import InvalidDicomError
 from skimage.morphology import binary_erosion
 from scipy import ndimage
 
-# According to Ahmad (2021) -> take soft tissue upper to be 170, not 100 HU
-# Upper bound of lung tissue is taken as -600 =>
-#     https://books.google.be/books?id=IJwZHPrDQYUC&pg=PA379&redir_esc=y#v=onepage&q&f=false
-tissue_hounsfield_units = {'soft': [0, 170], 'bone': [300, np.infty], 'fat': [-300, 0], 'lung': [-np.infty, -600],
-                           'soft_qaelum': [-300, 300]}
+
 # Threshold list as used in the original Resolution paper by Sanders
 sanders_threshold_list = [-475, -400, -200, -190, -175, -165, -155, -150]
 # Anam (2017) Truncation correction Factor - TP is not in % but from 0-1
@@ -20,30 +16,49 @@ anam_truncation_correction = 1.15
 # From there, I concluded to use only -400 HU and -200 HU as thresholds
 kwinten_threshold_list = [-400, -200]
 
+# Coefficients to calculate the f conversion factor for the SSDE as seen in AAPM report in 2014
+ssde_coefficients = {'Body': [3.704369, 0.03671937], 'Head': [1.874799, 0.03871313]}
 
-booo = 100
 
-def ssde_conversion(wed: float, phantom: str):
+def ssde_conversion_factor(wed: float, phantom: str):
+    r"""Conversion factors for translating CTDI in SSDE depending on patient size (WED)
+
+    Size specific dose estimate (SSDE) is calculated, taking into account the CTDI and size of the patient to come
+    to a better dose estimate for the patient. Coefficients to calculate this conversion come from AAPM report 204 [1]_
+    and 220 [2]_
+
+    Parameters
+    -----------
+    wed: float
+        Water Equivalent Diameter (in cm)
+    phantom: str
+        CTDI phantom that is used in calculating the SSDE conversion factor (different for children and adults).
+        Can be 'Body' or 'Head'
+
+    Returns
+    ---------
+    CTDI_to_SSDE: float
+        A conversion factor to turn CTDI into SSDE
+
+    References
+    ----------
+
+    .. [1] Boone, J. M., Strauss, K. J., Cody, D. D., McCollough, C. H., McNitt-Gray,
+           M. F., Toth, T. L., Goske, M. J., Frush, D. P. (2011).
+           AAPM Report 204: Size-Specific Dose Estimates (SSDE) in Pediatric and Adult Body CT Examinations.
+           In American Association of Physicists in Medicine
+    .. [2] McCollough, C., Bakalyar, D., Bostani, M., Brady, S., Boedeker, K., Boone, J. M., Chen-Mayer, H. H.,
+           Christianson, O. I., Leng, S., Baojun, L., McNitt-Gray, M. F., Nilsen, R. A., Supanich, M. P.,
+           Wang, J. (2014). AAPM Report 220: Use of Water Equivalent Diameter for Calculating Patient Size and
+           Size-Specific Dose Estimates (SSDE) in CT
+
+
     """
-        Conversion factors for translating CTDI in SSDE depending on patient size (WED)
-
-        Parameters
-        -----------
-        wed: float
-            Water Equivalent Diameter (in cm)
-        phantom: str
-            CTDI phantom that is used in calculating the SSDE conversion factor (different for children and adults)
-
-        Returns
-        ---------
-        float:
-            A conversion factor to turn CTDI into SSDE
-        """
     a, b = ssde_coefficients[phantom]
     return a * np.exp(-b * wed)
 
 
-def process_kernel(kernel):
+def process_kernel(kernel: str):
     # This method deals with iterative kernels that are given as lists e.g; ['Br40', '3']
     #       and returns one single 'Br40-3'. We use a dash '-' as seperator
     separator = '-'
@@ -52,7 +67,7 @@ def process_kernel(kernel):
     return kernel
 
 
-def remove_circular_edge(image):
+def remove_circular_edge(image: np.ndarray[float]):
     image = image.astype(float)
     dimensions = image.shape
     radius_circle = dimensions[0] / 2
@@ -68,30 +83,57 @@ def remove_circular_edge(image):
             corner_max = np.nanmax(corner)
             corner_truncated.append(corner_max == image_minimum)
     circular_truncation = all(corner_truncated)
+    truncated = False
     if circular_truncation:
         positions = np.arange(-radius_circle + 0.5, radius_circle, 1)
         nx, ny = np.meshgrid(positions, positions)
         distance_to_center = np.sqrt(nx ** 2 + ny ** 2)
         outside_truncation = distance_to_center > radius_circle
         image[outside_truncation] = np.nan
-    return image
+        truncated = True
+    return image, truncated
 
 
-def body_segmentation(image, threshold_list):
-    # Step 1: the image (in HU) is processed with multiple thresholds (in HU). Pixels that
-    #       pass all thresholds will have value = No. thresholds
+def body_segmentation(image: np.ndarray[float], threshold_list: list[float]):
+    r"""Segment patient body from background
+
+    Searches for the contour of the patient based on a list of HU thresholds.
+    Each threshold creates a mask on which a hole filling operation is performed.
+    Pixels that are part of each threshold are stored as signal in a binary mask.
+    Each structure (separate shape) in the binary image is then labeled with the largest single structure
+    assumed to be the patient and the image is segmented accordingly. The method is based on [1]_
+
+    Parameters
+    ----------
+    image : np.ndarray[float]
+        Array of HU axial image
+    threshold_list : list[float]
+        List of HU thresholds.
+
+    Returns
+    -------
+    mask: np.ndarray[int])
+          binary mask of the patient body
+    contour: np.ndarray[float]
+          image of patient where pixels outside body equal NaN
+
+
+    References
+    ----------
+
+    .. [1] Sanders, J., Hurwitz, L., Samei, E. (2016). Patient-specific quantification of image quality:
+           An automated method for measuring spatial resolution in clinical CT images. Medical Physics,43(10),
+           5330–5338. https://doi.org/10.1118/1.4961984
+    """
+
     threshold_image = np.zeros(image.shape, dtype=np.uint8)
     for threshold in threshold_list:
         threshold_image += np.array(ndimage.binary_fill_holes(image > threshold))
     nb_thresholds = len(threshold_list)
-    # If pixel passes all thresholds, it is part of the binary image
     binary_image = np.array(threshold_image == nb_thresholds, dtype=np.uint8)
-    # Next each pixel is numbered: background = 0, structure 1 = 1, structure 2 = 2, ...
     labels, label_nb = ndimage.label(binary_image)
-    # Then count the amount of pixels per structure. Don't include background
     label_count = np.bincount(labels.ravel().astype(int))
-    label_count[0] = 0
-    # Body segmentation will assume that largest structure is body and thus use it for mask
+    label_count[0] = 0  # Largest (0) is background, this one is excluded
     mask = np.array(labels == label_count.argmax(), dtype=np.uint8)
     mask = np.multiply(mask, 1, dtype=np.uint8)
     segment = mask.astype(np.float32)
@@ -100,30 +142,36 @@ def body_segmentation(image, threshold_list):
     return mask, body
 
 
-def tissue_fractions(image):
-    # This function will calculate the fractions of different tissues in an image
-    total_pixels = len(image[np.logical_not(np.isnan(image))])
-    hu_soft = tissue_hounsfield_units['soft']
-    hu_fat = tissue_hounsfield_units['fat']
-    hu_bone = tissue_hounsfield_units['bone']
-    hu_lung = tissue_hounsfield_units['lung']
-    soft = len(image[np.logical_and(hu_soft[1] > image, image >= hu_soft[0])]) / total_pixels
-    fat = len(image[np.logical_and(hu_fat[1] > image, image >= hu_fat[0])]) / total_pixels
-    bone = len(image[np.logical_and(hu_bone[1] > image, image >= hu_bone[0])]) / total_pixels
-    lung = len(image[np.logical_and(hu_lung[1] > image, image >= hu_lung[0])]) / total_pixels
-    return lung, fat, soft, bone
+def fraction_truncation(image: np.ndarray[float], mask: np.ndarray[int]):
+    r"""Calculate the fraction of patient contour that is truncated
+
+    Compares the contour of the patient in the image to the contour of the patient that is cut off by the image or FOV
+    border. Based on [1]_
+
+    Parameters
+    ----------
+    image : np.ndarray[float]
+        Array of HU axial image
+    mask : np.ndarray[int]
+        Array with a binary mask of the patient contour
+
+    Returns
+    -------
+    truncation_fraction: float
+          Percentage of patient that is truncated by display or FOV region
+    contour: np.ndarray[int]
+          Binary image where signal equals the patient contour
+    fov_contour: np.ndarray[float]
+        Binary image where signal equals the contour of the displayed/FOV region
 
 
-def normalize_image(image, center, width):
-    img_min = center - width // 2
-    img_max = center + width // 2
-    window_image = image.copy()
-    window_image[window_image < img_min] = img_min
-    window_image[window_image > img_max] = img_max
-    return window_image
+    References
+    ----------
 
-
-def fraction_truncation(image, mask):
+    .. [1] Anam, C., Haryanto, F., Widita, R., Arif, I., Dougherty, G. (2017).
+           The size-specific dose estimate (SSDE) for truncated computed tomography images.
+           Radiation Protection Dosimetry, 175(3), 313–320. https://doi.org/10.1093/rpd/ncw326
+    """
     contour = mask.copy()
     fov_contour = np.logical_not(np.isnan(image))
     fov_erosion = binary_erosion(fov_contour)
@@ -139,23 +187,51 @@ def fraction_truncation(image, mask):
     truncated_length = truncated_pixels - 1
     non_truncated_length = non_truncated_pixels - 1
 
-    truncated_fraction = truncated_length / (non_truncated_length + truncated_length)
-    return truncated_fraction, contour, fov_contour
+    truncation_fraction = truncated_length / (non_truncated_length + truncated_length)
+    return truncation_fraction, contour, fov_contour
 
 
-def wed_truncation_correction(wed, truncation_percentage, scaling_parameter=anam_truncation_correction):
+def truncation_corrected_wed(wed: float, truncation_percentage: float, scaling_parameter=anam_truncation_correction):
+    r"""Calculate the truncation corrected WED
+
+    Compares the contour of the patient in the image to the contour of the patient that is cut off by the image or FOV
+    border. Based on [1]_
+
+    Parameters
+    ----------
+    wed : float
+        Water Equivalent Diameter (cm)
+    truncation_percentage : float
+        Percentage of patient that is truncated by display or FOV region
+    scaling_parameter: float
+        Parameter that relates truncation percentage to a correction factor. This function uses the correction factor
+        for THORAX as found by Anam [1]_
+
+    Returns
+    -------
+    corrected_wed: float
+          WED corrected for truncation by image or FOV border
+    truncation_correction: float
+          Factor that relates truncation corrected to truncation uncorrected WED
+
+
+    References
+    ----------
+
+    .. [1] Anam, C., Haryanto, F., Widita, R., Arif, I., Dougherty, G. (2017).
+           The size-specific dose estimate (SSDE) for truncated computed tomography images.
+           Radiation Protection Dosimetry, 175(3), 313–320. https://doi.org/10.1093/rpd/ncw326
+    """
     truncation_correction = np.exp(scaling_parameter * truncation_percentage ** 3)
     corrected_wed = truncation_correction * wed
     return corrected_wed, truncation_correction
 
 
-# Coefficients to calculate the f conversion factor for the SSDE as seen in AAPM report in 2014
-ssde_coefficients = {'Body': [3.704369, 0.03671937], 'Head': [1.874799, 0.03871313]}
-
-
 class Image:
+
     def __init__(self, directory, file, process=True):
 
+        self.image_truncation = None
         self.Study_ID = None
         self.Procedure = None
         self.StudyDate = None
@@ -197,7 +273,6 @@ class Image:
                 self.set_basic_dicom_info()
                 self.set_array()
                 self.mask_and_body_segmentation()
-                # self.set_tissue_fractions()
                 self.calculate_ssde()
 
     def _transform_to_hu(self, array):
@@ -395,7 +470,7 @@ class Image:
         if self.valid:
             try:
                 self.array = self.dicom.pixel_array.astype(float)
-                self.array = remove_circular_edge(self.array)
+                self.array, self.image_truncation = remove_circular_edge(self.array)
                 self.slope = self.dicom.RescaleSlope
                 self.intercept = self.dicom.RescaleIntercept
                 self.raw_hu = self._transform_to_hu(self.array)
@@ -413,12 +488,6 @@ class Image:
             except (AttributeError, TypeError):
                 self.area = np.nan
 
-    # def set_tissue_fractions(self):
-    #     try:
-    #         self.lung, self.fat, self.soft, self.bone = tissue_fractions(self.body)
-    #     except (AttributeError, TypeError):
-    #         self.lung, self.fat, self.soft, self.bone = None, None, None, None
-
     def calculate_ssde(self):
         try:
             self.average_hu = np.nanmean(self.body)
@@ -435,17 +504,14 @@ class Image:
             self.truncated_fraction, self.body_contour, self.fov_contour = np.nan, np.nan, np.nan
         try:
             self.WED, self.WED_correction_factor = \
-                wed_truncation_correction(self.WED_uncorrected, self.truncated_fraction)
+                truncation_corrected_wed(self.WED_uncorrected, self.truncated_fraction)
         except (AttributeError, TypeError):
             self.WED, self.WED_correction_factor = self.WED_uncorrected, np.nan
         try:
-            self.f = ssde_conversion(self.WED, self.ctdi_phantom)  # ssde conversion factor in cm-1
+            self.f = ssde_conversion_factor(self.WED, self.ctdi_phantom)  # ssde conversion factor in cm-1
             self.SSDE = self.f * self.CTDI_vol
         except (AttributeError, TypeError):
             self.f, self.SSDE = np.nan, np.nan
-
-    def set_global_noise(self, global_noise):
-        self.global_noise = global_noise
 
     def set_slice_number(self, new_slice_number):
         self.SliceNumber = new_slice_number
@@ -457,3 +523,47 @@ class Image:
         tissue_percentage = tissue_area / self.area
         return tissue_area, tissue_percentage
 
+
+########################################################################################################################
+#
+# OBSOLETE
+#
+#
+# According to Ahmad (2021) -> take soft tissue upper to be 170, not 100 HU
+# Upper bound of lung tissue is taken as -600 =>
+# https://books.google.be/books?id=IJwZHPrDQYUC&pg=PA379&redir_esc=y#v=onepage&q&f=false
+# tissue_hounsfield_units = {'soft': [0, 170],
+#                            'bone': [300, np.infty],
+#                            'fat': [-300, 0],
+#                            'lung': [-np.infty, -600],
+#                            'soft_qaelum': [-300, 300]}
+#
+#
+# def tissue_fractions(image):
+#     # This function will calculate the fractions of different tissues in an image
+#     total_pixels = len(image[np.logical_not(np.isnan(image))])
+#     hu_soft = tissue_hounsfield_units['soft']
+#     hu_fat = tissue_hounsfield_units['fat']
+#     hu_bone = tissue_hounsfield_units['bone']
+#     hu_lung = tissue_hounsfield_units['lung']
+#     soft = len(image[np.logical_and(hu_soft[1] > image, image >= hu_soft[0])]) / total_pixels
+#     fat = len(image[np.logical_and(hu_fat[1] > image, image >= hu_fat[0])]) / total_pixels
+#     bone = len(image[np.logical_and(hu_bone[1] > image, image >= hu_bone[0])]) / total_pixels
+#     lung = len(image[np.logical_and(hu_lung[1] > image, image >= hu_lung[0])]) / total_pixels
+#     return lung, fat, soft, bone
+#
+#
+# def normalize_image(image, center, width):
+#     img_min = center - width // 2
+#     img_max = center + width // 2
+#     window_image = image.copy()
+#     window_image[window_image < img_min] = img_min
+#     window_image[window_image > img_max] = img_max
+#     return window_image
+#
+#
+# def set_tissue_fractions(self):
+#     try:
+#         self.lung, self.fat, self.soft, self.bone = tissue_fractions(self.body)
+#     except (AttributeError, TypeError):
+#         self.lung, self.fat, self.soft, self.bone = None, None, None, None
